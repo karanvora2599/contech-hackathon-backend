@@ -115,15 +115,16 @@ class ParseResponse(BaseModel):
     status: str
     details: Optional[dict] = None
     
-# ===========================
-# Pydantic Models for Query
-# ===========================
+
+# Define the request model
 class QueryRequest(BaseModel):
     query: str
+    query_type: str  # 'neptune' or 'ims'
 
+# Define the response model
 class QueryResponse(BaseModel):
     query: str
-    response: Any
+    response: dict  # or use `Any` for more flexibility
 
 # Load API Key from environment
 DEFAULT_MODEL = "llama-3.2-90b-vision-preview"  # Default model for OCR
@@ -160,14 +161,26 @@ def create_session_with_credentials(credentials: dict, region: str = "us-east-1"
         region_name=region
     )
     
-# ===========================
-# Utility Functions
-# ===========================
+def get_account_hash_from_account_id(account_id: str):
+    return hashlib.md5(account_id.encode("utf-8")).hexdigest()
+
+def create_session_with_credentials(credentials: dict, region: str = "us-east-1"):
+    return boto3.Session(
+        aws_access_key_id=credentials['AccessKeyId'],
+        aws_secret_access_key=credentials['SecretAccessKey'],
+        aws_session_token=credentials['Token'],
+        region_name=region
+    )
+
+def create_session_with_env_credentials(region: str = "us-east-1"):
+    return boto3.Session(
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        aws_session_token=os.getenv('AWS_SESSION_TOKEN'),
+        region_name=region
+    )
 
 def get_aws_auth_token(session):
-    """
-    Retrieve AWS authentication token details from the session.
-    """
     credentials = session.get_credentials().get_frozen_credentials()
     region = session.region_name or "us-east-1"  # Default to us-east-1 if region is None
     service_name = "execute-api"  # Correct service name for Neptune queries
@@ -177,36 +190,45 @@ def get_aws_auth_token(session):
         "region": region
     }
 
-def get_account_hash_from_account_id(account_id: str):
-    """
-    Generate an MD5 hash from the AWS account ID.
-    """
-    return hashlib.md5(account_id.encode("utf-8")).hexdigest()
-
 def get_account_hash_from_session(session):
-    """
-    Retrieve the AWS account ID from the session and generate its hash.
-    """
     sts_client = session.client("sts")
     account_id = sts_client.get_caller_identity()["Account"]
     return get_account_hash_from_account_id(account_id)
 
 def get_intelligence_base_url_from_session(session):
-    """
-    Construct the base URL for the intelligence service based on the account hash.
-    """
     account_hash = get_account_hash_from_session(session)
     return f"https://intelligence.{account_hash}.gryps.io"
 
-# ===========================
-# Neptune Query Handler
-# ===========================
+# =============================
+# Query Handlers
+# =============================
 
+# IMS Query Handler
+class IMSQueryHandler:
+    def __init__(self, session):
+        self.session = session
+
+    def list_of_databases(self):
+        return wr.catalog.databases(boto3_session=self.session)
+
+    def list_of_tables(self, database):
+        return wr.catalog.tables(database=database, boto3_session=self.session)
+
+    def query(self, query: str, database: str):
+        try:
+            return wr.athena.read_sql_query(
+                query, 
+                database=database, 
+                boto3_session=self.session, 
+                ctas_approach=False, 
+                workgroup="AmazonAthenaLakeFormation"
+            ).to_dict(orient='records')
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+# Neptune Query Handler
 class NeptuneQueryHandler:
     def __init__(self, session):
-        """
-        Initialize the NeptuneQueryHandler with AWS session details.
-        """
         auth_details = get_aws_auth_token(session)
         self.credentials = auth_details["credentials"]
         self.service_name = auth_details["service_name"]
@@ -214,9 +236,6 @@ class NeptuneQueryHandler:
         self.base_url = get_intelligence_base_url_from_session(session)
 
     def query(self, query, output_format="json"):
-        """
-        Execute a SPARQL query against Amazon Neptune and return the results.
-        """
         payload = json.dumps({"query": query})
         headers = {"Content-Type": "application/json"}
         aws_request = AWSRequest(
@@ -228,39 +247,55 @@ class NeptuneQueryHandler:
         SigV4Auth(self.credentials, self.service_name, self.region).add_auth(aws_request)
         signed_headers = dict(aws_request.headers)
 
-        response = requests.post(
-            aws_request.url,
-            headers=signed_headers,
-            data=payload,
-            timeout=180,
-        )
-
-        if response.status_code != 200:
-            print(f"Error: {response.status_code}, {response.text}")  # Debugging
+        try:
+            response = requests.post(
+                aws_request.url,
+                headers=signed_headers,
+                data=payload,
+                timeout=180,
+            )
             response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(status_code=response.status_code if 'response' in locals() else 500,
+                                detail=str(e))
 
         if output_format == "json":
             return response.json()
         elif output_format == "pandas":
             return self._convert_to_pandas(response.json())
         else:
-            raise ValueError("Invalid output format. Please use 'json' or 'pandas'.")
+            raise HTTPException(status_code=400, detail="Invalid output format. Please use 'json' or 'pandas'.")
 
     def _convert_to_pandas(self, response):
-        """
-        Convert the JSON response from Neptune into a pandas DataFrame.
-        """
         lst = []
         for item in response.get("results", {}).get("bindings", []):
-            d = {k: v.get("value") for k, v in item.items()}
+            d = {k: v["value"] for k, v in item.items()}
             lst.append(d)
         if lst:
-            df = pd.json_normalize(lst)
-            return df
-        return pd.DataFrame()
+            return pd.json_normalize(lst).to_dict(orient="records")
+        return []
     
-session = create_session_with_credentials(credentials)
+s# =============================
+# Initialize Query Handlers
+# =============================
+
+# Option 1: Using Temporary Credentials (Not Recommended for Production)
+# credentials = {
+#     'AccessKeyId': 'YOUR_ACCESS_KEY_ID',
+#     'SecretAccessKey': 'YOUR_SECRET_ACCESS_KEY',
+#     'Token': 'YOUR_SESSION_TOKEN',
+#     'Expiration': 'EXPIRATION_TIME',
+#     'Code': 'Success',
+#     'Message': None
+# }
+# session = create_session_with_credentials(credentials)
+# neptune_client = NeptuneQueryHandler(session=session)
+# ims_client = IMSQueryHandler(session=session)
+
+# Option 2: Using Environment Variables (Recommended)
+session = create_session_with_env_credentials()
 neptune_client = NeptuneQueryHandler(session=session)
+ims_client = IMSQueryHandler(session=session)
 
 # =========================================
 # Utility Functions
@@ -897,28 +932,87 @@ async def parse_document(request: ParseRequest):
         logger.error(f"Unexpected error during document parsing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error during parsing.")
     
-@app.post("/query", response_model=QueryResponseModel)
-def execute_query(request: QueryRequestModel):
-    logger.info("Received Neptune query request.")
-    logger.debug(f"Neptune query received: {request.query}")
+# @app.post("/query", response_model=QueryResponseModel)
+# def execute_query(request: QueryRequestModel):
+#     logger.info("Received Neptune query request.")
+#     logger.debug(f"Neptune query received: {request.query}")
 
+#     try:
+#         data = neptune_client.query(request.query, output_format="json")
+#         logger.info("Neptune query executed successfully.")
+#         return QueryResponseModel(query=request.query, response=data)
+
+#     except HTTPException as he:
+#         # Re-raise HTTPExceptions to be handled by the global exception handler
+#         logger.warning(f"HTTPException during Neptune query: {he.detail}")
+#         raise he
+
+#     except Exception as e:
+#         # Log unexpected exceptions and raise a generic HTTPException
+#         logger.error(f"Unexpected error during Neptune query: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail="Internal server error during Neptune query.")
+
+# if __name__ == "__main__":
+#     uvicorn.run("api2:app", host="0.0.0.0", port=8000)
+
+@app.post("/query", response_model=QueryResponse)
+def execute_query(query_request: QueryRequest):
+    """
+    Execute a query against AWS services (Neptune or IMS) and return the results.
+    """
+    query_type = query_request.query_type.lower()
+    query = query_request.query
+
+    if query_type == "neptune":
+        try:
+            response = neptune_client.query(query, output_format="json")
+            return QueryResponse(query=query, response=response)
+        except HTTPException as http_exc:
+            raise http_exc
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    elif query_type == "ims":
+        # For IMS queries, you might need to specify the database
+        # Here, we'll assume that the query includes the database selection
+        # Alternatively, you can extend the QueryRequest model to include a 'database' field
+        try:
+            # Extract database from query or set a default
+            # For simplicity, let's set a default database
+            default_database = "your_default_database"
+            response = ims_client.query(query, database=default_database)
+            return QueryResponse(query=query, response=response)
+        except HTTPException as http_exc:
+            raise http_exc
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        raise HTTPException(status_code=400, detail="Invalid query type. Use 'neptune' or 'ims'.")
+
+# =============================
+# Additional Endpoints (Optional)
+# =============================
+
+@app.get("/list-databases", response_model=dict)
+def list_databases():
+    """
+    List available databases using IMSQueryHandler.
+    """
     try:
-        data = neptune_client.query(request.query, output_format="json")
-        logger.info("Neptune query executed successfully.")
-        return QueryResponseModel(query=request.query, response=data)
-
-    except HTTPException as he:
-        # Re-raise HTTPExceptions to be handled by the global exception handler
-        logger.warning(f"HTTPException during Neptune query: {he.detail}")
-        raise he
-
+        databases = ims_client.list_of_databases()
+        return {"databases": databases}
     except Exception as e:
-        # Log unexpected exceptions and raise a generic HTTPException
-        logger.error(f"Unexpected error during Neptune query: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error during Neptune query.")
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    uvicorn.run("api2:app", host="0.0.0.0", port=8000)
+@app.get("/list-tables/{database}", response_model=dict)
+def list_tables(database: str):
+    """
+    List tables in a specified database using IMSQueryHandler.
+    """
+    try:
+        tables = ims_client.list_of_tables(database)
+        return {"tables": tables}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     
 # =========================================
 # API Endpoints
