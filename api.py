@@ -1,5 +1,6 @@
 import logging
 import time
+import traceback  # Ensure traceback is imported
 import os
 import json
 from typing import Optional
@@ -11,7 +12,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
-from cerebras.cloud.sdk import Cerebras
+from cerebras.cloud.sdk import Cerebras  # Ensure this SDK is installed
+from gryps_utils import NeptuneQueryHandler, IMSQueryHandler  # Import your utility classes
 
 # Configure logging
 LOG_DIR = os.path.abspath("logs")
@@ -52,6 +54,15 @@ class ParseRequest(BaseModel):
 class ParseResponse(BaseModel):
     status: str
     details: Optional[dict] = None
+    
+# Pydantic model for query request
+class QueryRequest(BaseModel):
+    query: str = Field(..., example="Your SPARQL query here.")
+
+# Pydantic model for query response
+class QueryResponse(BaseModel):
+    query: str
+    response: Union[dict, list, str]  # Adjust based on expected response types
 
 # Load API Key from environment
 CEREBRAS_API_KEY = os.getenv(
@@ -119,13 +130,13 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"message": exc.detail},
     )
 
-# Global exception handler for unhandled exceptions
+# Global exception handler
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.error(
         f"Unhandled exception: {exc} - Path: {request.url.path}"
     )
-    logger.debug(traceback.format_exc())
+    logger.debug(traceback.format_exc())  # Now, traceback is defined
     return JSONResponse(
         status_code=500,
         content={"message": "Internal server error"},
@@ -211,6 +222,31 @@ async def parse_document(request: ParseRequest):
     except Exception as e:
         logger.error(f"Unexpected error during document parsing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error during parsing.")
+
+# New endpoint to execute SPARQL queries against Neptune
+@app.post("/query", response_model=QueryResponse)
+async def execute_query(request: QueryRequest):
+    logger.info("Received request to execute SPARQL query.")
+    logger.debug(f"SPARQL query received: {request.query[:100]}...")  # Log first 100 chars
+
+    try:
+        # Initialize NeptuneQueryHandler with the appropriate AWS profile
+        neptune_client = NeptuneQueryHandler(profile_name="default")  # Adjust profile_name as needed
+
+        # Execute the query
+        query_result = neptune_client.query(request.query, output_format="json")
+
+        logger.info("SPARQL query executed successfully.")
+
+        return QueryResponse(query=request.query, response=query_result)
+
+    except HTTPException as he:
+        logger.warning(f"HTTPException during SPARQL query execution: {he.detail}")
+        raise he  # Re-raise to be handled by global handlers
+
+    except Exception as e:
+        logger.error(f"Unexpected error during SPARQL query execution: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during SPARQL query execution.")
 
 # Entry point
 if __name__ == "__main__":
