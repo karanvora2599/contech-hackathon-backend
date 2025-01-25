@@ -50,8 +50,9 @@ console_handler.setFormatter(detailed_formatter)
 
 # Configure root logger
 logger = logging.getLogger("RDF")
-logger.setLevel(logging.DEBUG)  # Set to DEBUG to capture all logs
-logger.addHandler(file_handler)
+logger.setLevel(logging.DEBUG)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(detailed_formatter)
 logger.addHandler(console_handler)
 
 # Pydantic model for parse request
@@ -84,15 +85,14 @@ class QueryResponse(BaseModel):
     response: Any
 
 # Load API Key from environment
-CEREBRAS_API_KEY = os.getenv(
-    "CEREBRAS_API_KEY"  # Replace with your actual API key or set as environment variable
-)
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 
+# AWS credentials should be loaded from environment variables
 credentials = {
-    'AccessKeyId': 'YOUR_ACCESS_KEY_ID',           # Replace with your Access Key ID
-    'SecretAccessKey': 'YOUR_SECRET_ACCESS_KEY',   # Replace with your Secret Access Key
-    'Token': 'YOUR_SESSION_TOKEN',                 # Replace with your Session Token if using temporary credentials
-    'Expiration': '2025-01-25T21:22:53Z',          # Example expiration timestamp
+    'AccessKeyId': os.getenv('AWS_ACCESS_KEY_ID'),
+    'SecretAccessKey': os.getenv('AWS_SECRET_ACCESS_KEY'),
+    'Token': os.getenv('AWS_SESSION_TOKEN'),
+    'Expiration': '2025-01-25T21:52:53Z',
     'Code': 'Success',
     'Message': None
 }
@@ -218,7 +218,7 @@ class NeptuneQueryHandler:
 session = create_session_with_credentials(credentials)
 neptune_client = NeptuneQueryHandler(session=session)
 
-app = FastAPI()
+app = FastAPI(root_path="/api")
 
 # CORS configuration
 app.add_middleware(
@@ -411,3 +411,6 @@ def execute_query(request: QueryRequestModel):
         # Log unexpected exceptions and raise a generic HTTPException
         logger.error(f"Unexpected error during Neptune query: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error during Neptune query.")
+
+if __name__ == "__main__":
+    uvicorn.run("api2:app", host="0.0.0.0", port=8000)
