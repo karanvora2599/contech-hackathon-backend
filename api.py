@@ -1,48 +1,67 @@
 import logging
-import platform
-import traceback
+import time
+import os
+import json
+from typing import Optional
+
 from logging.handlers import TimedRotatingFileHandler
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 import uvicorn
-import os
+
+from cerebras.cloud.sdk import Cerebras
 
 # Configure logging
 LOG_DIR = os.path.abspath("logs")
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
+os.makedirs(LOG_DIR, exist_ok=True)
 
 log_file_path = os.path.join(LOG_DIR, "RDF.log")
 
-# Create a timed rotating file handler (daily rotation)
+# Create handlers
 file_handler = TimedRotatingFileHandler(
     filename=log_file_path,
-    when="midnight",       # Rotate at midnight
-    interval=1,            # Every 1 day
-    backupCount=7,         # Keep 7 days of logs
+    when="midnight",
+    interval=1,
+    backupCount=7,
     encoding="utf-8"
 )
 
-file_handler.setLevel(logging.DEBUG)  # Capture all levels
-file_formatter = logging.Formatter(
-    "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-file_handler.setFormatter(file_formatter)
-
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  # Console shows INFO and above
-console_formatter = logging.Formatter(
-    "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-console_handler.setFormatter(console_formatter)
 
+# Create formatters with more context
+detailed_formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s"
+)
+
+file_handler.setFormatter(detailed_formatter)
+console_handler.setFormatter(detailed_formatter)
+
+# Configure root logger
 logger = logging.getLogger("RDF")
-logger.setLevel(logging.DEBUG)  # Capture all levels
+logger.setLevel(logging.INFO)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# Initialize FastAPI app
+# Pydantic model for parse request
+class ParseRequest(BaseModel):
+    document_text: str = Field(..., example="Your document text here.")
+
+# Pydantic model for parse response
+class ParseResponse(BaseModel):
+    status: str
+    details: Optional[dict] = None
+
+# Load API Key from environment
+CEREBRAS_API_KEY = os.getenv(
+    "CEREBRAS_API_KEY"  # Replace with your actual API key or set as environment variable
+)
+
+# Define prompts or other constants if needed
+class Prompts:
+    DOCUMENT_SYSTEM_PROMPT = "You are a helpful assistant that parses documents into structured JSON."
+
 app = FastAPI()
 
 # CORS configuration
@@ -67,37 +86,27 @@ async def shutdown_event():
 # Middleware to log request and response details
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f"Incoming request: {request.method} {request.url}")
-    # Optionally log request headers
-    logger.debug(f"Request headers: {dict(request.headers)}")
-    
+    client_host = request.client.host if request.client else "unknown"
+    logger.info(f"Request received from {client_host}: {request.method} {request.url}")
+
+    start_time = time.time()
     try:
         response = await call_next(request)
     except Exception as e:
-        logger.error(f"Unhandled exception during request: {e}")
-        logger.debug(traceback.format_exc())
-        raise e  # Re-raise the exception after logging
-    
-    logger.info(f"Response status: {response.status_code}")
+        logger.error(f"Request error: {str(e)}", exc_info=True)
+        raise
+
+    process_time = time.time() - start_time
+    response_log = f"Response: {response.status_code} | Processing time: {process_time:.2f}s"
+
+    if response.status_code >= 500:
+        logger.error(response_log)
+    elif response.status_code >= 400:
+        logger.warning(response_log)
+    else:
+        logger.info(response_log)
+
     return response
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    logger.info("Health check endpoint called")
-    return {"status": "healthy"}
-
-# Example endpoint with additional logging and error handling
-@app.get("/items/{item_id}")
-async def read_item(item_id: int, q: str = None):
-    logger.debug(f"Processing request for item_id: {item_id}, query: {q}")
-    if item_id < 0:
-        logger.warning(f"Invalid item_id received: {item_id}")
-        raise HTTPException(status_code=400, detail="Item ID must be non-negative")
-    # Simulate processing
-    item = {"item_id": item_id, "q": q}
-    logger.info(f"Returning item: {item}")
-    return item
 
 # Global exception handler for HTTPException
 @app.exception_handler(HTTPException)
@@ -107,7 +116,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail},
+        content={"message": exc.detail},
     )
 
 # Global exception handler for unhandled exceptions
@@ -119,8 +128,95 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.debug(traceback.format_exc())
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal Server Error"},
+        content={"message": "Internal server error"},
     )
 
+# Health check endpoint with detailed logging
+@app.get("/health")
+async def health_check():
+    logger.info("Starting health check")
+    try:
+        # Add actual health checks here (e.g., database connection)
+        logger.debug("Performing health check validations")
+        return {"status": "healthy", "details": "All systems operational"}
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Service unavailable",
+        ) from e
+    finally:
+        logger.info("Completed health check")
+
+def LLM_Text_Parse(document_text: str, api_key: str) -> Optional[dict]:
+    """
+    Parses the extracted text using Cerebras' LLM and returns structured JSON.
+    """
+    logger.info("Starting parsing of extracted text with Cerebras' LLM.")
+    try:
+        client = Cerebras(api_key=api_key)
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": Prompts.DOCUMENT_SYSTEM_PROMPT.strip()
+                },
+                {
+                    "role": "user",
+                    "content": document_text
+                }
+            ],
+            temperature=1,
+            max_tokens=8192,
+            top_p=1,
+            stream=False,
+            response_format={"type": "json_object"},
+            stop=None,
+        )
+
+        # Gather and return the output
+        parsed_content = completion.choices[0].message.content
+        try:
+            JSONOutput = json.loads(parsed_content)
+            logger.info("Successfully parsed text with Cerebras' LLM.")
+            return JSONOutput
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON from Cerebras' response: {e}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error generating system prompt for Cerebras' LLM: {e}", exc_info=True)
+        return None
+
+# New endpoint to parse text using LLM
+@app.post("/parse", response_model=ParseResponse)
+async def parse_document(request: ParseRequest):
+    logger.info("Received request to parse document.")
+    logger.debug(f"Document text received: {request.document_text[:100]}...")  # Log first 100 chars
+
+    try:
+        parsed_result = LLM_Text_Parse(document_text=request.document_text, api_key=CEREBRAS_API_KEY)
+        if parsed_result is None:
+            logger.error("Parsing failed due to invalid JSON response.")
+            raise HTTPException(status_code=500, detail="Failed to parse document.")
+
+        logger.info("Document parsed successfully.")
+        return ParseResponse(status="success", details=parsed_result)
+
+    except HTTPException as he:
+        logger.warning(f"HTTPException during parsing: {he.detail}")
+        raise he  # Re-raise to be handled by global handlers
+
+    except Exception as e:
+        logger.error(f"Unexpected error during document parsing: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during parsing.")
+
+# Entry point
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    logger.info("Starting application server")
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    except Exception as e:
+        logger.critical(f"Server failed to start: {str(e)}", exc_info=True)
+        raise
