@@ -3,7 +3,7 @@ import time
 import traceback  # Ensure traceback is imported
 import os
 import json
-from typing import Optional
+from typing import Optional, Union, List
 
 from logging.handlers import TimedRotatingFileHandler
 from fastapi import FastAPI, Request, HTTPException
@@ -42,27 +42,28 @@ console_handler.setFormatter(detailed_formatter)
 
 # Configure root logger
 logger = logging.getLogger("RDF")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # Set to DEBUG to capture all logs
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 # Pydantic model for parse request
 class ParseRequest(BaseModel):
     document_text: str = Field(..., example="Your document text here.")
+    system_prompt: Optional[str] = Field(
+        None,
+        example="You are an assistant that extracts key information from documents."
+    )
+    temperature: Optional[float] = Field(1.0, example=0.7)
+    max_tokens: Optional[int] = Field(2048, example=1500)
+    top_p: Optional[float] = Field(0.9, example=0.8)
+    stream: Optional[bool] = Field(False, example=True)
+    response_format: Optional[dict] = Field({"type": "json_object"}, example={"type": "json_object"})
+    stop: Optional[Union[str, List[str]]] = Field(None, example=["\n"])
 
 # Pydantic model for parse response
 class ParseResponse(BaseModel):
     status: str
     details: Optional[dict] = None
-    
-# Pydantic model for query request
-class QueryRequest(BaseModel):
-    query: str = Field(..., example="Your SPARQL query here.")
-
-# Pydantic model for query response
-class QueryResponse(BaseModel):
-    query: str
-    response: Union[dict, list, str]  # Adjust based on expected response types
 
 # Load API Key from environment
 CEREBRAS_API_KEY = os.getenv(
@@ -159,31 +160,45 @@ async def health_check():
     finally:
         logger.info("Completed health check")
 
-def LLM_Text_Parse(document_text: str, api_key: str) -> Optional[dict]:
+def LLM_Text_Parse(
+    document_text: str,
+    api_key: str,
+    system_prompt: Optional[str] = None,
+    temperature: float = 1.0,
+    max_tokens: int = 8192,
+    top_p: float = 1.0,
+    stream: bool = False,
+    response_format: dict = {"type": "json_object"},
+    stop: Optional[Union[str, List[str]]] = None
+) -> Optional[dict]:
     """
     Parses the extracted text using Cerebras' LLM and returns structured JSON.
     """
     logger.info("Starting parsing of extracted text with Cerebras' LLM.")
     try:
         client = Cerebras(api_key=api_key)
+        
+        # Use the provided system prompt or default if not provided
+        prompt = system_prompt if system_prompt else Prompts.DOCUMENT_SYSTEM_PROMPT.strip()
+        
         completion = client.chat.completions.create(
             model="llama-3.3-70b",
             messages=[
                 {
                     "role": "system",
-                    "content": Prompts.DOCUMENT_SYSTEM_PROMPT.strip()
+                    "content": prompt
                 },
                 {
                     "role": "user",
                     "content": document_text
                 }
             ],
-            temperature=1,
-            max_tokens=8192,
-            top_p=1,
-            stream=False,
-            response_format={"type": "json_object"},
-            stop=None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stream=stream,
+            response_format=response_format,
+            stop=stop,
         )
 
         # Gather and return the output
@@ -200,14 +215,24 @@ def LLM_Text_Parse(document_text: str, api_key: str) -> Optional[dict]:
         logger.error(f"Error generating system prompt for Cerebras' LLM: {e}", exc_info=True)
         return None
 
-# New endpoint to parse text using LLM
+# New endpoint to parse text using LLM with customizable parameters
 @app.post("/parse", response_model=ParseResponse)
 async def parse_document(request: ParseRequest):
     logger.info("Received request to parse document.")
     logger.debug(f"Document text received: {request.document_text[:100]}...")  # Log first 100 chars
 
     try:
-        parsed_result = LLM_Text_Parse(document_text=request.document_text, api_key=CEREBRAS_API_KEY)
+        parsed_result = LLM_Text_Parse(
+            document_text=request.document_text,
+            api_key=CEREBRAS_API_KEY,
+            system_prompt=request.system_prompt,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            top_p=request.top_p,
+            stream=request.stream,
+            response_format=request.response_format,
+            stop=request.stop
+        )
         if parsed_result is None:
             logger.error("Parsing failed due to invalid JSON response.")
             raise HTTPException(status_code=500, detail="Failed to parse document.")
@@ -222,37 +247,3 @@ async def parse_document(request: ParseRequest):
     except Exception as e:
         logger.error(f"Unexpected error during document parsing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error during parsing.")
-
-# New endpoint to execute SPARQL queries against Neptune
-@app.post("/query", response_model=QueryResponse)
-async def execute_query(request: QueryRequest):
-    logger.info("Received request to execute SPARQL query.")
-    logger.debug(f"SPARQL query received: {request.query[:100]}...")  # Log first 100 chars
-
-    try:
-        # Initialize NeptuneQueryHandler with the appropriate AWS profile
-        neptune_client = NeptuneQueryHandler(profile_name="default")  # Adjust profile_name as needed
-
-        # Execute the query
-        query_result = neptune_client.query(request.query, output_format="json")
-
-        logger.info("SPARQL query executed successfully.")
-
-        return QueryResponse(query=request.query, response=query_result)
-
-    except HTTPException as he:
-        logger.warning(f"HTTPException during SPARQL query execution: {he.detail}")
-        raise he  # Re-raise to be handled by global handlers
-
-    except Exception as e:
-        logger.error(f"Unexpected error during SPARQL query execution: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error during SPARQL query execution.")
-
-# Entry point
-if __name__ == "__main__":
-    logger.info("Starting application server")
-    try:
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-    except Exception as e:
-        logger.critical(f"Server failed to start: {str(e)}", exc_info=True)
-        raise
