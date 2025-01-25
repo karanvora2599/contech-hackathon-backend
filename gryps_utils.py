@@ -13,10 +13,11 @@ from pprint import pprint
 
 
 def get_aws_auth_token_from_sso_profile(
-    profile_name: str, region_name: str = "us-east-1"
+    profile_name: str = None, region_name: str = "us-east-1", boto3_session: boto3.Session = None
 ):
-    base_session = boto3.Session(profile_name=profile_name, region_name=region_name)
-    sigv4 = Sigv4Auth(boto3_session=base_session)
+    if boto3_session is None:
+        boto3_session = boto3.Session(profile_name=profile_name, region_name=region_name)
+    sigv4 = Sigv4Auth(boto3_session=boto3_session)
     return sigv4
 
 
@@ -59,9 +60,17 @@ class IMSQueryHandler:
 
 
 class NeptuneQueryHandler:
-    def __init__(self, profile_name: str):
-        self.auth = get_aws_auth_token_from_sso_profile(profile_name)
-        self.base_url = get_intelligence_base_url_from_sso_profile(profile_name)
+    def __init__(self, profile_name: str = None, boto3_session: boto3.Session = None):
+        if boto3_session is not None:
+            self.auth = get_aws_auth_token_from_sso_profile(boto3_session=boto3_session)
+            account_id = boto3_session.client("sts").get_caller_identity()["Account"]
+            account_hash = get_account_hash_from_account_id(account_id)
+            self.base_url = f"https://intelligence.{account_hash}.gryps.io"
+        elif profile_name is not None:
+            self.auth = get_aws_auth_token_from_sso_profile(profile_name)
+            self.base_url = get_intelligence_base_url_from_sso_profile(profile_name)
+        else:
+            raise ValueError("Either 'profile_name' or 'boto3_session' must be provided.")
 
     def query(self, query, output_format="json"):
         payload = json.dumps({"query": query})
@@ -83,7 +92,6 @@ class NeptuneQueryHandler:
             print("Invalid output format. Please use 'json' or 'pandas'.")
 
     def _convert_to_pandas(self, response):
-
         lst = []
         df = pd.DataFrame()
         for item in response["results"]["bindings"]:
