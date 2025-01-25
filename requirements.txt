@@ -7,3 +7,24 @@ pandas
 requests
 awswrangler
 cerebras-cloud-sdk
+ollama
+groq
+pytesseract
+opencv-python
+numpy
+pandas
+matplotlib
+fastapi
+pydantic
+uvicorn
+pillow
+streamlit
+python-multipart
+pypdf2
+pymupdf
+python-dotenv
+pikepdf
+pdf2image
+docx2txt
+#ollama run llama3.2-vision
+#ollama run minicpm-v
