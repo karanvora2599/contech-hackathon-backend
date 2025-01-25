@@ -1,4 +1,9 @@
-iamauth
-awswrangler
-cerebras_cloud_sdk
+fastapi
 uvicorn
+python-multipart
+pydantic
+boto3
+pandas
+requests
+awswrangler
+cerebras-cloud-sdk
